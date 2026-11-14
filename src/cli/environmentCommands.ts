@@ -11,13 +11,17 @@ import type { ServedState } from "../application/environment/environmentState.js
 import { z } from "incur";
 import type { Logger } from "pino";
 
-import { CLI_COMMANDS } from "../cliCommandNames.js";
+import {
+  CLI_COMMANDS,
+  DEFAULT_INFO_LOGGING_COMMANDS,
+} from "../cliCommandNames.js";
 import { parseCliJsonInput } from "../cliJsonInput.js";
 import { logCliCommand } from "../cliLogging.js";
 import { parseEnvironmentName } from "../config/environmentName.js";
 import {
+  mcpHttpHostSchema,
+  mcpHttpPortSchema,
   parseMcpHttpEndpoint,
-  mcpHttpListenerPortSchema,
   type McpHttpEndpoint,
 } from "../config/mcpHttpEndpoint.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
@@ -37,6 +41,7 @@ import { inspectWebNetworkCaptureInputSchema } from "../domain/webNetworkCapture
 import { withCommandCancellation } from "./commandCancellation.js";
 import { finishAnalysisCommand } from "./finishAnalysisCommand.js";
 import type { CliInstance } from "./types.js";
+import { cliDecimalField, publishArgvInput } from "./options.js";
 
 /** Same envelope label as the other JSON-input commands and `parseCliJsonInput`. */
 const cliError = (error: AnalysisError): JsonValue => ({
@@ -46,10 +51,12 @@ const cliError = (error: AnalysisError): JsonValue => ({
 
 /** The listener announces its URL, and a build its stages, at info like `rea mcp --http`; an explicit REA_LOG_LEVEL still wins. */
 const infoLogger = (
+  command: string,
   environment: Readonly<NodeJS.ProcessEnv>,
   logger: Logger,
 ): Logger =>
-  environment.REA_LOG_LEVEL === undefined
+  environment.REA_LOG_LEVEL === undefined &&
+  DEFAULT_INFO_LOGGING_COMMANDS.has(command)
     ? createLogger("cli", "info")
     : logger;
 
@@ -177,7 +184,11 @@ const serveEnvironmentCommand = async (
     source,
     served: { state, report },
   } = inputs.value;
-  const commandLogger = infoLogger(environment, logger);
+  const commandLogger = infoLogger(
+    CLI_COMMANDS.environmentServe,
+    environment,
+    logger,
+  );
   if (!report.served && report.reason === "unavailable")
     commandLogger.warn(
       { code: report.code, error: report.message },
@@ -330,22 +341,16 @@ const conflictingRules = (): JsonValue =>
     ]),
   );
 
-const isEvidenceValue = (value: unknown): boolean =>
-  typeof value === "object" &&
-  value !== null &&
-  "evidence_id" in value &&
-  "normalized_result" in value;
-
 /** Inspect a HAR as inspect-web-network-capture does and serialize the Evidence as it prints it; a refusal is the command's output. */
 const inspectBuildHar = async (
   capturePath: string,
+  callerInputPath: string,
   captureTimeoutMs: number | undefined,
   environment: Readonly<NodeJS.ProcessEnv>,
   signal: AbortSignal,
 ): Promise<Result<EnvironmentExportFile, JsonValue>> => {
   const { createWebNetworkCaptureService } =
     await import("../composition/webNetworkCaptures.js");
-  const { parseEvidence } = await import("../domain/evidence.js");
   const { environmentExportEvidenceFile } =
     await import("../application/environment/environmentExport.js");
   const { ENVIRONMENT_BUILD_OPERATION } =
@@ -362,24 +367,25 @@ const inspectBuildHar = async (
             : { capture_timeout_ms: captureTimeoutMs }),
         },
         { signal },
+        { capture: callerInputPath },
       ),
     service,
     "web-network-capture",
     "inspect_web_network_capture",
     signal,
   );
-  if (!isEvidenceValue(inspected))
+  if (!inspected.ok)
     return err({
       error: "Application workflow failed",
-      ...(inspected as Record<string, JsonValue>),
+      ...inspected.error,
     });
   const file = await environmentExportEvidenceFile(
     "evidence",
     capturePath,
-    parseEvidence(inspected),
+    inspected.value,
     ENVIRONMENT_BUILD_OPERATION,
   );
-  return file.ok ? ok(file.value) : err(cliError(file.error));
+  return file.ok ? file : err(cliError(file.error));
 };
 
 /** Read the capture once, then build or plan the bundle from it. */
@@ -414,7 +420,11 @@ const buildEnvironmentCommand = async (
         ],
       ),
     );
-  const commandLogger = infoLogger(environment, logger);
+  const commandLogger = infoLogger(
+    CLI_COMMANDS.environmentBuild,
+    environment,
+    logger,
+  );
   const progress = (stage: string): void => {
     commandLogger.info({ stage }, "Building environment");
   };
@@ -423,6 +433,7 @@ const buildEnvironmentCommand = async (
     progress("inspect");
     const inspected = await inspectBuildHar(
       capturePath,
+      input.capture,
       input.captureTimeoutMs,
       environment,
       signal,
@@ -436,6 +447,7 @@ const buildEnvironmentCommand = async (
       "evidence",
       capturePath,
       ENVIRONMENT_BUILD_OPERATION,
+      ["capture"],
     );
     if (!read.ok) return cliError(read.error);
     capture = read.value;
@@ -517,8 +529,10 @@ const registerBuildCommand = (
         .boolean()
         .default(false)
         .describe("Run every stage and report, but write nothing"),
-      captureTimeoutMs:
+      // Decimal tokens only: numeric coercion would read "0x1" as 1 ms.
+      captureTimeoutMs: cliDecimalField(
         inspectWebNetworkCaptureInputSchema.shape.capture_timeout_ms,
+      ),
     }),
     run: ({ args, options }) =>
       withCommandCancellation((signal) =>
@@ -684,16 +698,17 @@ export const registerEnvironmentCommands = (
         .describe(
           "Serve pure replay: derive no state, serve every manifest tool from its retained records and answer every /agentenv method as not found",
         ),
-      host: z
-        .string()
-        .min(1)
+      // Flags use the MCP_HOST and MCP_PORT owners shared with rea mcp --http.
+      host: mcpHttpHostSchema
         .optional()
         .describe("Listener address; default MCP_HOST, else 127.0.0.1"),
-      port: mcpHttpListenerPortSchema
-        .optional()
-        .describe(
-          "Listener port; default MCP_PORT, else 0 for an ephemeral port",
-        ),
+      port: publishArgvInput(
+        mcpHttpPortSchema
+          .optional()
+          .describe(
+            "Listener port; default MCP_PORT, else 0 for an ephemeral port",
+          ),
+      ),
     }),
     run: ({ args, options }) =>
       withCommandCancellation((signal) =>

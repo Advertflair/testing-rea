@@ -10,7 +10,7 @@ import {
   removeTestWorkspace,
 } from "../../support/workspace/workspaceFixture.js";
 import { PwntoolsRecordedCrashProvider } from "../../../src/native/pwntools/PwntoolsRecordedCrashProvider.js";
-import { PWNTOOLS_PROVIDER_IDENTITY } from "../../../src/native/pwntools/PwntoolsRelease.js";
+import { PWNTOOLS_PROVIDER_IDENTITY } from "../../../src/native/pwntools/PwntoolsProviderIdentity.js";
 import {
   spawnOwnedProviderProcess,
   type OwnedProviderProcessSpawnOptions,
@@ -550,7 +550,6 @@ it.runIf(host)(
     expect(projected.remediation.action).toContain("above 1500");
     expect(projected.remediation.action).not.toContain("above 30000");
   },
-  10_000,
 );
 
 const fixture = async (

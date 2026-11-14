@@ -1,3 +1,4 @@
+import { readFieldDefinitionRow } from "./ManagedFieldDefinitionRows.js";
 import {
   readMethodDefinitionRow,
   type ManagedMethodImplementationFlags,
@@ -12,7 +13,10 @@ import {
   type ManagedNativeBoundaryInspection,
   type ManagedParseIssue,
 } from "../domain/managed/managedArtifact.js";
-import type { ManagedMetadataLayout } from "./ManagedMetadataLayout.js";
+import {
+  MANAGED_CODED_INDEXES,
+  type ManagedMetadataLayout,
+} from "./ManagedMetadataLayout.js";
 import {
   metadataRowCursor,
   decodeMetadataCodedIndex,
@@ -92,19 +96,15 @@ export const parseFields = (
   const table = layout.table(4);
   for (let row = 1; row <= (table?.rowCount ?? 0); row += 1) {
     readManagedValue(() => {
-      const cursor = metadataRowCursor(bytes, layout, 4, row);
-      const flags = cursor.readUInt16();
-      const name = readMetadataString(
+      const { token, rowOffset, flags, nameIndex } = readFieldDefinitionRow(
         bytes,
         layout,
-        cursor.readIndex(layout.stringIndexSize),
-        heapExtent,
+        row,
       );
-      cursor.readIndex(layout.blobIndexSize);
-      const token = metadataToken(4, row);
+      const name = readMetadataString(bytes, layout, nameIndex, heapExtent);
       fields.set(token, {
         token,
-        rowOffset: cursor.start,
+        rowOffset,
         kind: "field",
         name,
         flags,
@@ -181,8 +181,8 @@ export const parseImplMaps = ({
       );
       const memberForwarded = decodeMetadataCodedIndex(
         memberForwardedRaw,
-        1,
-        [4, 6],
+        MANAGED_CODED_INDEXES.MemberForwarded.bits,
+        MANAGED_CODED_INDEXES.MemberForwarded.tables,
         layout.rowCounts,
       );
       if (memberForwarded.kind !== "valid")
@@ -226,7 +226,12 @@ export const parseImplMaps = ({
         mapping_flags: mappingFlags,
         mapping_flags_hex: flagsHex(mappingFlags),
         member_token: memberToken,
-        member_kind: member?.kind ?? "unknown",
+        member_kind:
+          memberForwarded.kind !== "valid"
+            ? "unknown"
+            : memberForwarded.table === 4
+              ? "field"
+              : "method",
         member_name: member?.name ?? null,
         import_name: importName,
         import_scope_token: importScopeToken,
@@ -316,9 +321,15 @@ export const nativeImplementations = (
   const implementations: NativeImplementation[] = [];
   for (const method of methods) {
     if (method.kind !== "method") continue;
-    const { codeType, managedKind, pinvokeFlag } = method.implementation;
+    const { codeType, managedKind, pinvokeFlag, internalCall } =
+      method.implementation;
     const pinvokeDeclared = pinvokeTokens.has(method.token) || pinvokeFlag;
-    if (!pinvokeDeclared && codeType === "il" && managedKind === "managed")
+    if (
+      !pinvokeDeclared &&
+      !internalCall &&
+      codeType === "il" &&
+      managedKind === "managed"
+    )
       continue;
     implementations.push({
       token: method.token,
@@ -330,7 +341,12 @@ export const nativeImplementations = (
       code_type: codeType,
       managed_kind: managedKind,
       pinvoke_declared: pinvokeDeclared,
-      boundary_kind: boundaryKind(pinvokeDeclared, codeType, managedKind),
+      boundary_kind: boundaryKind(
+        pinvokeDeclared,
+        codeType,
+        managedKind,
+        internalCall,
+      ),
       body_interpretation:
         method.rva === 0 ? "not-file-backed" : "native-or-runtime",
     });
@@ -342,10 +358,11 @@ const boundaryKind = (
   pinvokeDeclared: boolean,
   codeType: ManagedMethodImplementationFlags["codeType"],
   managedKind: ManagedMethodImplementationFlags["managedKind"],
+  internalCall: boolean,
 ): NativeImplementation["boundary_kind"] => {
   if (pinvokeDeclared) return "pinvoke";
   if (codeType === "native") return "native-body";
-  if (codeType === "runtime") return "runtime-provided";
+  if (codeType === "runtime" || internalCall) return "runtime-provided";
   if (managedKind === "unmanaged") return "unmanaged-method";
   return "mixed-or-unknown";
 };

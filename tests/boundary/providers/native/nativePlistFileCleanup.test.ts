@@ -6,8 +6,10 @@ import { ArtifactFileCleanupFailure } from "../../../../src/artifacts/ArtifactFi
 import {
   NativeFixtureRunner,
   nativeMachoTarget,
+  nativeMachoTargetForFile,
 } from "../../../fixtures/nativeCommands.js";
 import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js";
+import { awaitAcknowledgement } from "../../../fixtures/lifecycleAcknowledgement.js";
 import { OwnedFileHandle } from "../../../../src/filesystem/OwnedFileHandle.js";
 import { ProviderCleanupError } from "../../../../src/domain/providerCleanupError.js";
 import { resolvedAnalysisError } from "../../../../src/domain/analysisErrorBase.js";
@@ -46,7 +48,6 @@ it("does not adopt a command's arbitrary thrown cleanup marker as a file owner",
   const run = vi.spyOn(runner, "run").mockRejectedValueOnce(foreign);
   onTestFinished(() => run.mockRestore());
   const result = await client.execute("inspect_plist", { path });
-  expect(result.ok).toBe(false);
   if (result.ok) throw new Error("Expected opaque command failure");
   expect(result.error.cause).toBe(foreign);
   expect(result.error.cleanupIncomplete).toBe(false);
@@ -109,7 +110,6 @@ it("keeps mixed client cleanup live until both file and tracer owners resolve", 
   });
   expect((await client.execute("inspect_plist", { path })).ok).toBe(false);
   const first = await client.close();
-  expect(first.ok).toBe(false);
   if (first.ok) throw new Error("Expected both pending owners");
   expect(new Set(first.error.cleanupResources)).toEqual(
     new Set([path, "trace-owner"]),
@@ -169,7 +169,6 @@ it.for(["path-input", "target"] as const)(
       "inspect_plist",
       selection === "target" ? {} : { path },
     );
-    expect(result.ok).toBe(false);
     if (result.ok) throw new Error("Expected retained cleanup failure");
     expect(result.error).toMatchObject({
       cleanupIncomplete: true,
@@ -237,7 +236,6 @@ for (const readFails of [false, true])
       { path },
       { signal: controller.signal },
     );
-    expect(result.ok).toBe(false);
     if (result.ok) throw new Error("Expected retained close failure");
     const failure = result.error.cause;
     expect(failure).toBeInstanceOf(ArtifactFileCleanupFailure);
@@ -269,7 +267,6 @@ it.each([null, 0, new ProviderCleanupError("foreign", ["unowned"], {})])(
       { path },
       { signal: controller.signal },
     );
-    expect(result.ok).toBe(false);
     if (result.ok) throw new Error("Expected pre-admission cancellation");
     expect(result.error.cause).toBe(reason);
     expect(result.error.cleanupIncomplete).toBe(false);
@@ -289,7 +286,6 @@ it("retains a failed admission close before any native command", async () => {
     run.mockRestore();
   });
   const result = await client.execute("inspect_plist", { path });
-  expect(result.ok).toBe(false);
   if (result.ok) throw new Error("Expected failed admission close");
   expect(result.error.cleanupResources).toContain(path);
   expect(result.error.cleanupIncomplete).toBe(true);
@@ -322,13 +318,13 @@ it("preserves an opaque cancellation observed during successful prefix close", a
     { path },
     { signal: controller.signal },
   );
-  expect(result.ok).toBe(false);
   if (result.ok) throw new Error("Expected late cancellation");
   expect(result.error).toMatchObject({
     operation: "inspect_plist",
     cause: reason,
     cleanupIncomplete: false,
   });
+  expect(result.error.cause).toBe(reason);
   expect(result.error.cleanupResources).not.toContain("unowned-resource");
   expect((await client.close()).ok).toBe(true);
 });
@@ -393,17 +389,22 @@ it.for([
           exitCode: args[1] === "json" ? 1 : 0,
         });
       });
-    onTestFinished(() => {
+    onTestFinished(async () => {
       resume();
       resumeValidation();
-      read.mockRestore();
-      commands.mockRestore();
+      try {
+        await inspecting;
+      } finally {
+        read.mockRestore();
+        commands.mockRestore();
+        await client.close();
+      }
     });
     const inspecting = client.execute("inspect_plist", {
       path,
       native_command_timeout_ms: 1500,
     });
-    await entered;
+    await awaitAcknowledgement(entered, inspecting, "plist file read");
     let finished = false;
     const closing = client.close().then((result) => {
       finished = true;
@@ -416,7 +417,11 @@ it.for([
       error: { _tag: "AnalysisCapabilityUnavailableError" },
     });
     resume();
-    await Promise.race([validationEntered, inspecting]);
+    await awaitAcknowledgement(
+      validationEntered,
+      inspecting,
+      "plist validation",
+    );
     expect(validationStarted).toBe(true);
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(finished).toBe(false);
@@ -451,3 +456,66 @@ it.for([
     });
   },
 );
+
+it("preserves a failed app plist read and its cleanup when the executable changes", async () => {
+  const root = await createTestTempDirectory("rea-app-plist-primary-");
+  const path = join(root, "Info.plist");
+  const executable = join(root, "program");
+  await writeFile(path, "<plist><string>value</string></plist>");
+  await writeFile(executable, "original executable");
+  const target = {
+    ...(await nativeMachoTargetForFile(executable)),
+    bundleInfoPlist: path,
+  };
+  const probe = await open(path, "r");
+  const inode = (await probe.stat()).ino;
+  const prototype = Object.getPrototypeOf(probe) as FileHandle;
+  await probe.close();
+  const primary = Object.assign(new Error("controlled plist read failure"), {
+    code: "EIO",
+  });
+  const cleanup = new Error("controlled plist close failure");
+  const original = prototype.read;
+  let release: (() => Promise<void>) | undefined;
+  let closeAttempts = 0;
+  const read = vi.spyOn(prototype, "read").mockImplementation(async function (
+    this: FileHandle,
+    ...args: Parameters<FileHandle["read"]>
+  ) {
+    if ((await this.stat()).ino !== inode)
+      return Reflect.apply(original, this, args);
+    await writeFile(executable, "changed executable");
+    release = this.close.bind(this);
+    this.close = async () => {
+      closeAttempts += 1;
+      if (closeAttempts === 1) throw cleanup;
+      await release!();
+    };
+    throw primary;
+  });
+  const client = new NativeMacOSProvider(
+    {},
+    new NativeFixtureRunner({ file: "ASCII text" }),
+    "darwin",
+  ).createClient(target);
+  onTestFinished(async () => {
+    read.mockRestore();
+    await release?.();
+    await client.close();
+  });
+  const result = await client.execute("inspect_plist", {});
+  if (result.ok) throw new Error("Expected retained plist failure");
+  expect(result.error.cleanupResources).toEqual([path]);
+  expect(result.error.cause).toBeInstanceOf(ArtifactFileCleanupFailure);
+  const failure = result.error.cause as ArtifactFileCleanupFailure;
+  expect(failure.fileCleanupFailure.outcome).toEqual({
+    kind: "failed",
+    cause: primary,
+  });
+  expect(failure.fileCleanupFailure.cleanupCause).toBe(cleanup);
+  expect(closeAttempts).toBe(1);
+  expect((await client.close()).ok).toBe(true);
+  expect(closeAttempts).toBe(2);
+  expect(result.error.cleanupIncomplete).toBe(false);
+  expect(resolvedAnalysisError(result.error).cause).toBe(primary);
+});

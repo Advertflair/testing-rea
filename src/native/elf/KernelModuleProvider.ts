@@ -1,20 +1,24 @@
-import { isSelectedRegularFileError } from "../../filesystem/RegularFile.js";
+import {
+  projectSelectedArtifactFileFailure,
+  projectStableArtifactFailure,
+  stableArtifactInputRecovery,
+  projectArtifactCloseFailure,
+} from "../../artifacts/StableArtifactFailure.js";
 import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
-import { readStableArtifact } from "../../artifacts/readStableArtifact.js";
+import {
+  type StableArtifactSnapshot,
+  readStableArtifact,
+} from "../../artifacts/readStableArtifact.js";
 import {
   artifactFilePrimaryFacts,
   type ArtifactFilePrimaryFacts,
-  bindArtifactFileCleanup,
   artifactFileCancellationCause,
 } from "../../artifacts/ArtifactFileOperation.js";
 import { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
-import { analysisErrorWithCleanupFailure } from "../../domain/analysisErrorCleanup.js";
-import { completedStableArtifactObservation } from "../../artifacts/StableArtifactObservation.js";
 import type { KernelModulePort } from "../../application/binaryDiagnostics/KernelModulePort.js";
 import type { ExecutionOptions } from "../../application/AnalysisProvider.js";
 import { ArtifactOperationError } from "../../domain/artifactOperationError.js";
 import {
-  AnalysisAccessDeniedError,
   AnalysisArtifactChangedError,
   AnalysisCancelledError,
   AnalysisInputError,
@@ -28,7 +32,6 @@ import {
   type InspectKernelModuleInput,
 } from "../../domain/native/kernelModule.js";
 import { err, ok } from "../../domain/result.js";
-import { ProviderCleanupError } from "../../domain/providerCleanupError.js";
 import { KERNEL_MODULE_PROVIDER } from "../../domain/investigationProviders.js";
 import {
   BinaryFormatFailure,
@@ -47,26 +50,19 @@ export class KernelModuleProvider implements KernelModulePort {
     try {
       await this.#resources.close();
     } catch (cause: unknown) {
-      if (
-        !(cause instanceof ArtifactReaderFailure) ||
-        cause.cleanup === undefined
-      )
-        throw cause;
-      const error = new ProviderCleanupError(
+      throw projectArtifactCloseFailure(
+        cause,
         KERNEL_MODULE_PROVIDER.id,
-        cause.cleanup.resources,
-        { reason: cause.cleanup.reason },
-        { cause, operation: OPERATION },
+        OPERATION,
       );
-      bindArtifactFileCleanup(cause, error);
-      throw error;
     }
   }
 
   async inspect(input: InspectKernelModuleInput, options?: ExecutionOptions) {
+    let snapshot: StableArtifactSnapshot | undefined;
     try {
       return await this.#resources.run(async () => {
-        const snapshot = await readStableArtifact(
+        snapshot = await readStableArtifact(
           input.path,
           input.max_file_bytes,
           options?.signal,
@@ -86,7 +82,7 @@ export class KernelModuleProvider implements KernelModulePort {
         );
       });
     } catch (cause) {
-      return err(kernelModuleFailure(cause, input));
+      return err(kernelModuleFailure(cause, input, snapshot));
     }
   }
 }
@@ -195,28 +191,25 @@ const kernelModuleFailurePrimary = (
       );
     }
     if (cause.reason === "path" || cause.reason === "format")
-      return new AnalysisInputError(OPERATION, { cause }, [
-        {
-          path: ["path"],
-          reason: "invalid_format",
-          message: cause.message,
-        },
-      ]);
+      return new AnalysisInputError(
+        OPERATION,
+        { cause, ...stableArtifactInputRecovery(cause) },
+        [
+          {
+            path: ["path"],
+            reason: "invalid_format",
+            message: cause.message,
+          },
+        ],
+      );
   }
-  if (cause instanceof Error && "code" in cause) {
-    if (cause.code === "EACCES" || cause.code === "EPERM")
-      return new AnalysisAccessDeniedError(OPERATION, input.path, cause.code, {
-        cause,
-      });
-    if (isSelectedRegularFileError(cause))
-      return new AnalysisInputError(OPERATION, { cause }, [
-        {
-          path: ["path"],
-          reason: "invalid_value",
-          message: `Selected kernel module could not be read (${String(cause.code)}): ${input.path}.`,
-        },
-      ]);
-  }
+  const fileFailure = projectSelectedArtifactFileFailure(
+    cause,
+    OPERATION,
+    input.path,
+    "kernel module",
+  );
+  if (fileFailure !== undefined) return fileFailure;
   return new ArtifactOperationError(
     OPERATION,
     origin === "owned-or-classified" && cause instanceof ArtifactReaderFailure
@@ -231,22 +224,18 @@ const kernelModuleFailurePrimary = (
 const kernelModuleFailure = (
   cause: unknown,
   input: InspectKernelModuleInput,
+  snapshot?: StableArtifactSnapshot,
 ) => {
   const primary = kernelModuleFailurePrimary(
     artifactFilePrimaryFacts(cause),
     input,
   );
-  const observation = completedStableArtifactObservation(cause, input.path);
-  if (observation !== undefined) primary.retainPartialObservation(observation);
-  if (!(cause instanceof ArtifactReaderFailure) || cause.cleanup === undefined)
-    return primary;
-  const cleanup = new ProviderCleanupError(
+  return projectStableArtifactFailure(
+    cause,
+    primary,
+    input.path,
     KERNEL_MODULE_PROVIDER.id,
-    cause.cleanup.resources,
-    { reason: cause.cleanup.reason },
-    { operation: OPERATION, cause },
+    OPERATION,
+    snapshot,
   );
-  const error = analysisErrorWithCleanupFailure(primary, cleanup, OPERATION);
-  bindArtifactFileCleanup(cause, error);
-  return error;
 };

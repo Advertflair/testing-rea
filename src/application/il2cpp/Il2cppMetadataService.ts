@@ -44,7 +44,7 @@ export class Il2cppMetadataService {
   async close(): Promise<void> {
     let failure: AnalysisError | undefined;
     for (const close of [
-      () => this.provider.close?.(),
+      () => this.provider.close(),
       () => this.seeds?.close(),
     ]) {
       try {
@@ -106,32 +106,6 @@ export class Il2cppMetadataService {
       options?.signal,
     );
     if (!input.ok) return input;
-    if (
-      input.value.binary_architecture !== undefined &&
-      input.value.binary_path === undefined
-    )
-      return err(
-        new AnalysisInputError(OPERATION, undefined, [
-          {
-            path: ["binary_architecture"],
-            reason: "invalid_value",
-            message: "binary_architecture selects a slice of binary_path.",
-          },
-        ]),
-      );
-    if (
-      input.value.generic_instances === true &&
-      input.value.binary_path === undefined
-    )
-      return err(
-        new AnalysisInputError(OPERATION, undefined, [
-          {
-            path: ["generic_instances"],
-            reason: "invalid_value",
-            message: "generic_instances links generic methods in binary_path.",
-          },
-        ]),
-      );
     if (output !== undefined) {
       if (input.value.binary_path === undefined)
         return err(

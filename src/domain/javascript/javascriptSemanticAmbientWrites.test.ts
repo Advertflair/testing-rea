@@ -1,13 +1,60 @@
 import * as t from "@babel/types";
 import { expect, it } from "vitest";
 
-import { analyzeJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
+import { analyzeJavaScriptStaticSource } from "../../../tests/fixtures/javascriptStaticAnalysis.js";
+import { indexJavaScriptBindingsWithReceiversSteps } from "./javascriptSemanticAnalysis.js";
+import { indexJavaScriptBindingsSteps } from "../../../tests/fixtures/javascriptSemanticIndex.js";
 import {
-  indexJavaScriptBindingsSteps,
-  indexJavaScriptBindingsWithReceiversSteps,
-} from "./javascriptSemanticAnalysis.js";
-import { completeSemanticSteps } from "./javascriptSemanticTraversal.js";
+  completeSemanticSteps,
+  traverseJavaScriptAst,
+} from "./javascriptSemanticTraversal.js";
+import {
+  createGlobalPathReader,
+  createGlobalReferenceReader,
+} from "./javascriptSemanticAmbientWrites.js";
 import { parseJavaScriptSource } from "./javascriptSourceParser.js";
+
+it.each([
+  [
+    "await value; Object.prototype.then=null; await value;",
+    ["unmodified", "null"],
+  ],
+  [
+    "Object.prototype.then=function(resolve){resolve()}; await value;",
+    ["function"],
+  ],
+  ["if(flag) Object.prototype.then=null; await value;", ["unknown"]],
+  ["mutate(Object.prototype); await value;", ["unknown"]],
+  ["await value; mutate(Object.prototype);", ["unmodified"]],
+  ["Array.prototype.then=null; await value;", ["unmodified"]],
+] as const)(
+  "reads intrinsic property facts at implicit await sites: %s",
+  (source, expected) => {
+    const parsed = parseJavaScriptSource(source, "app.mjs");
+    if (parsed === null) throw new Error("Expected implicit read fixture");
+    const state = completeSemanticSteps(
+      indexJavaScriptBindingsSteps(parsed.program),
+    );
+    const read = createGlobalPathReader(state, ["Object", "prototype", "then"]);
+    const statuses: string[] = [];
+    traverseJavaScriptAst(parsed.program, {
+      enter(node) {
+        if (!t.isAwaitExpression(node)) return;
+        const fact = read(node);
+        statuses.push(
+          fact.status === "replacement"
+            ? t.isNullLiteral(fact.value)
+              ? "null"
+              : t.isFunction(fact.value)
+                ? "function"
+                : "other"
+            : fact.status,
+        );
+      },
+    });
+    expect(statuses).toEqual(expected);
+  },
+);
 
 it("keeps wrapper module aliases distinct from global-object module properties", () => {
   const parsed = parseJavaScriptSource(
@@ -240,3 +287,101 @@ it("indexes unknown-key stores of fresh objects in linear stored-value work", ()
   // earlier value from every later store grows at least quadratically.
   expect(work(64)).toBeLessThan(3 * work(32));
 });
+
+it.each([
+  [
+    "before and after a direct replacement",
+    "inspect(Object.defineProperty);Object.defineProperty=()=>{};inspect(Object.defineProperty);",
+    ["unmodified", "replacement"],
+  ],
+  [
+    "an unrelated property",
+    "Object.assign=()=>{};inspect(Object.defineProperty);",
+    ["unmodified"],
+  ],
+  [
+    "a conditional replacement",
+    "if(flag)Object.defineProperty=()=>{};inspect(Object.defineProperty);",
+    ["unknown"],
+  ],
+  [
+    "a replaced parent",
+    "Object=input;inspect(Object.defineProperty);",
+    ["unknown"],
+  ],
+  [
+    "a lexical shadow",
+    "const Object={defineProperty(){}};inspect(Object.defineProperty);",
+    ["unrelated"],
+  ],
+  [
+    "an unproven alias write",
+    "const copy=Object;copy.defineProperty=()=>{};inspect(Object.defineProperty);",
+    ["unknown"],
+  ],
+  [
+    "a later write in a possibly repeated activation",
+    "function run(){inspect(Object.defineProperty);Object.defineProperty=()=>{};}",
+    ["unknown"],
+  ],
+  [
+    "competing unconditional replacements before a read",
+    "function run(){Object.defineProperty=()=>{};Object.defineProperty=()=>{};inspect(Object.defineProperty);}",
+    ["replacement"],
+  ],
+  [
+    "a repeated activation with a later write",
+    "function run(){inspect(Object.defineProperty);Object.defineProperty=()=>{};}run();run();",
+    ["unknown"],
+  ],
+  [
+    "a replaced global namespace",
+    "globalThis={Object:{}};globalThis.Object.defineProperty=()=>{};inspect(Object.defineProperty);",
+    ["unknown"],
+  ],
+  [
+    "a namespaced replacement read directly",
+    "globalThis.Object.defineProperty=()=>{};inspect(Object.defineProperty);",
+    ["replacement"],
+  ],
+  [
+    "a direct replacement read through the namespace",
+    "Object.defineProperty=()=>{};inspect(globalThis.Object.defineProperty);",
+    ["replacement"],
+  ],
+  [
+    "an escaped global owner",
+    "mutate(Object);inspect(Object.defineProperty);",
+    ["unknown"],
+  ],
+  [
+    "a namespaced global",
+    "inspect(globalThis.Object.defineProperty);globalThis.Object.defineProperty=()=>{};inspect(globalThis.Object.defineProperty);",
+    ["unmodified", "replacement"],
+  ],
+])(
+  "retains ordered global-reference facts for %s",
+  (_label, source, expected) => {
+    const parsed = parseJavaScriptSource(source, "app.cjs");
+    if (parsed === null) throw new Error("Expected global-reference fixture");
+    const state = completeSemanticSteps(
+      indexJavaScriptBindingsSteps(parsed.program),
+    );
+    const read = createGlobalReferenceReader(state, [
+      "Object",
+      "defineProperty",
+    ]);
+    const statuses: string[] = [];
+    traverseJavaScriptAst(parsed.program, {
+      enter(node) {
+        if (
+          t.isCallExpression(node) &&
+          t.isIdentifier(node.callee, { name: "inspect" }) &&
+          t.isNode(node.arguments[0])
+        )
+          statuses.push(read(node.arguments[0]).status);
+      },
+    });
+    expect(statuses).toEqual(expected);
+  },
+);

@@ -9,9 +9,10 @@ import {
   createGoPeHeaderPointerFixture,
 } from "../fixtures/go/image.js";
 import { connectLocalToolsMcp } from "../fixtures/localToolsMcp.js";
+import { expectCliMcpEvidenceParity } from "../fixtures/cliMcpEvidenceParity.js";
 import { parseMcpToolError } from "../fixtures/mcpToolError.js";
 import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
-import { cliTest, runFileCli } from "../support/cli/cliFixture.js";
+import { cliTest } from "../support/cli/cliFixture.js";
 
 cliTest(
   "retains header-backed PE and cross-load ELF pointer metadata through CLI and MCP",
@@ -33,7 +34,7 @@ cliTest(
     for (const { name, fixture } of cases) {
       const path = join(root, name);
       await writeFile(path, fixture.bytes);
-      const result = await runFileCli(cli, {
+      const result = await cli.run({
         arguments: ["inspect-go-binary", path, "--json"],
       });
       expect(result.exitCode, result.stderr).toBe(0);
@@ -55,7 +56,7 @@ cliTest(
       );
       const response = await call("inspect_go_binary", { path });
       expect(response.isError, JSON.stringify(response)).not.toBe(true);
-      expect(response.structuredContent).toEqual(evidence);
+      expectCliMcpEvidenceParity(evidence, response.structuredContent, path);
       expect(Buffer.compare(await readFile(path), fixture.bytes)).toBe(0);
     }
 
@@ -63,7 +64,7 @@ cliTest(
     damaged.bytes.writeBigUInt64LE(0x11001n, 200); // A one-byte virtual gap.
     const path = join(root, "elf-cross-load-gap");
     await writeFile(path, damaged.bytes);
-    const rejected = await runFileCli(cli, {
+    const rejected = await cli.run({
       arguments: ["inspect-go-binary", path, "--json"],
     });
     expect(rejected.exitCode).toBe(1);
@@ -75,5 +76,4 @@ cliTest(
     expect(parseMcpToolError(response)).toEqual({ error: rejected.json });
     await client.ping();
   },
-  60000,
 );

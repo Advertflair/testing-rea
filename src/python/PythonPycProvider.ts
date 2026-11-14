@@ -1,20 +1,25 @@
-import { isSelectedRegularFileError } from "../filesystem/RegularFile.js";
+import { PYTHON_PYC_PROVIDER_IDENTITY } from "./PythonPycProviderIdentity.js";
+import {
+  projectSelectedArtifactFileFailure,
+  projectStableArtifactFailure,
+  stableArtifactInputRecovery,
+  projectArtifactCloseFailure,
+} from "../artifacts/StableArtifactFailure.js";
 import {
   artifactFileCancellationCause,
   artifactFilePrimaryFacts,
   type ArtifactFilePrimaryFacts,
-  bindArtifactFileCleanup,
 } from "../artifacts/ArtifactFileOperation.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
-import { readStableArtifact } from "../artifacts/readStableArtifact.js";
+import {
+  type StableArtifactSnapshot,
+  readStableArtifact,
+} from "../artifacts/readStableArtifact.js";
 import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
-import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
-import { completedStableArtifactObservation } from "../artifacts/StableArtifactObservation.js";
 import type { PythonPycPort } from "../application/python/PythonPycPort.js";
 import type { ExecutionOptions } from "../application/AnalysisProvider.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import {
-  AnalysisAccessDeniedError,
   AnalysisArtifactChangedError,
   AnalysisCancelledError,
   AnalysisInputError,
@@ -26,20 +31,12 @@ import {
   type InspectPythonPycInput,
 } from "../domain/python/pythonPyc.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
-import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { err, ok } from "../domain/result.js";
 import {
   PythonPycFormatFailure,
   PythonPycResourceFailure,
 } from "./PythonPyc.errors.js";
 import { parsePythonPyc } from "./PythonPycParser.js";
-
-/** Bundled reader identity. Header python_version is a separate observed mapping. */
-export const PYTHON_PYC_PROVIDER_IDENTITY = {
-  id: "rea-python-pyc",
-  name: "REA CPython pyc parser",
-  version: "1",
-} as const;
 
 const OPERATION = "inspect_python_pyc";
 
@@ -132,28 +129,25 @@ const failureForPrimary = (
         },
       );
     if (cause.reason === "path" || cause.reason === "format")
-      return new AnalysisInputError(OPERATION, { cause }, [
-        {
-          path: ["path"],
-          reason: "invalid_format",
-          message: cause.message,
-        },
-      ]);
+      return new AnalysisInputError(
+        OPERATION,
+        { cause, ...stableArtifactInputRecovery(cause) },
+        [
+          {
+            path: ["path"],
+            reason: "invalid_format",
+            message: cause.message,
+          },
+        ],
+      );
   }
-  if (cause instanceof Error && "code" in cause) {
-    if (cause.code === "EACCES" || cause.code === "EPERM")
-      return new AnalysisAccessDeniedError(OPERATION, input.path, cause.code, {
-        cause,
-      });
-    if (isSelectedRegularFileError(cause))
-      return new AnalysisInputError(OPERATION, { cause }, [
-        {
-          path: ["path"],
-          reason: "invalid_value",
-          message: `Selected pyc could not be read (${String(cause.code)}): ${input.path}.`,
-        },
-      ]);
-  }
+  const fileFailure = projectSelectedArtifactFileFailure(
+    cause,
+    OPERATION,
+    input.path,
+    "pyc",
+  );
+  if (fileFailure !== undefined) return fileFailure;
   return new ProviderAdapterError(PYTHON_PYC_PROVIDER_IDENTITY.id, OPERATION, {
     cause,
     diagnostics: {
@@ -163,21 +157,20 @@ const failureForPrimary = (
   });
 };
 
-const failureFor = (cause: unknown, input: InspectPythonPycInput) => {
+const failureFor = (
+  cause: unknown,
+  input: InspectPythonPycInput,
+  snapshot?: StableArtifactSnapshot,
+) => {
   const primary = failureForPrimary(artifactFilePrimaryFacts(cause), input);
-  const observation = completedStableArtifactObservation(cause, input.path);
-  if (observation !== undefined) primary.retainPartialObservation(observation);
-  if (!(cause instanceof ArtifactReaderFailure) || cause.cleanup === undefined)
-    return primary;
-  const cleanup = new ProviderCleanupError(
+  return projectStableArtifactFailure(
+    cause,
+    primary,
+    input.path,
     PYTHON_PYC_PROVIDER_IDENTITY.id,
-    cause.cleanup.resources,
-    { reason: cause.cleanup.reason },
-    { operation: OPERATION, cause },
+    OPERATION,
+    snapshot,
   );
-  const error = analysisErrorWithCleanupFailure(primary, cleanup, OPERATION);
-  bindArtifactFileCleanup(cause, error);
-  return error;
 };
 
 /** Portable parser over one bounded, identity-checked regular file. */
@@ -189,25 +182,18 @@ export class PythonPycProvider implements PythonPycPort {
     try {
       await this.#resources.close();
     } catch (cause: unknown) {
-      if (
-        !(cause instanceof ArtifactReaderFailure) ||
-        cause.cleanup === undefined
-      )
-        throw cause;
-      const error = new ProviderCleanupError(
+      throw projectArtifactCloseFailure(
+        cause,
         PYTHON_PYC_PROVIDER_IDENTITY.id,
-        cause.cleanup.resources,
-        { reason: cause.cleanup.reason },
-        { cause, operation: OPERATION },
+        OPERATION,
       );
-      bindArtifactFileCleanup(cause, error);
-      throw error;
     }
   }
 
   async inspect(input: InspectPythonPycInput, options?: ExecutionOptions) {
+    let snapshot: StableArtifactSnapshot | undefined;
     try {
-      const snapshot = await this.#resources.run(() =>
+      snapshot = await this.#resources.run(() =>
         readStableArtifact(
           input.path,
           input.max_file_bytes,
@@ -228,7 +214,7 @@ export class PythonPycProvider implements PythonPycPort {
         ),
       );
     } catch (cause) {
-      return err(failureFor(cause, input));
+      return err(failureFor(cause, input, snapshot));
     }
   }
 }

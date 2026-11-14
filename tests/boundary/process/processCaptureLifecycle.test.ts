@@ -24,6 +24,7 @@ import { snapshotRoots } from "../../../src/process/capture/FilesystemSnapshot.j
 import { ProcessCaptureError } from "../../../src/process/capture/ProcessCaptureError.js";
 import { expectUnverifiedHostCleanup } from "../../support/hostCleanup.js";
 import {
+  PROCESS_CAPTURE_CLEANUP_INTERVENTION_UNKNOWN,
   ProcessCaptureResourceScope,
   type ProcessCaptureCleanupHost,
   observeLaunchedExecutable,
@@ -184,7 +185,7 @@ itWithCaptureCapability(
     onTestFinished(async () => {
       now.mockRestore();
       await resources.close();
-    }, 10_000);
+    });
     try {
       const result = await captureProcessScenario(
         processScenarioSchema.parse({
@@ -246,14 +247,15 @@ itWithCaptureCapability(
           },
         },
       );
-      expect(result.ok).toBe(true);
       if (!result.ok) throw result.error;
       expect(result.value.frames.length).toBeGreaterThan(0);
       expect(Date.parse(result.value.manifest.completed_at)).toBeLessThan(
         Date.parse(result.value.manifest.started_at),
       );
-      expect(result.value.limitations).toContain(
-        "Wall-clock completion time precedes start time; elapsed capture timing is recorded separately and remains monotonic.",
+      expect(result.value.limitations).toContainEqual(
+        expect.stringMatching(
+          /completion time precedes start time.*elapsed.*monotonic/iu,
+        ),
       );
       expect(
         result.value.frames.map(({ at_ms }) => at_ms),
@@ -312,10 +314,15 @@ itWithCaptureCapability(
       );
       if (cleanupIncomplete)
         expect(capture.settlement.cleanup_outcome).toBe("failed");
-      else
+      else {
         expect(result.ok && result.value.cleanup.owned_process_group).toBe(
           "verified",
         );
+        expect(capture.settlement.cleanup_outcome).toBe("cleaned");
+        expect(capture.residual_unknowns).toContainEqual(
+          PROCESS_CAPTURE_CLEANUP_INTERVENTION_UNKNOWN,
+        );
+      }
       await waitForProcessExit(ownedPid);
       const unownedState = await processState(unownedPid);
       expect(unownedState).toBeDefined();
@@ -353,7 +360,14 @@ itWithCaptureCapability(
   "retains collected observations when completion and cleanup both fail",
   async () => {
     let snapshotCalls = 0;
-    const captureSnapshot: typeof snapshotRoots = async () => {
+    const snapshotObserverPaths: string[][] = [];
+    const captureSnapshot: typeof snapshotRoots = async (
+      _scenario,
+      _signal,
+      _before,
+      resources,
+    ) => {
+      snapshotObserverPaths.push([...(resources?.observerPaths ?? [])]);
       snapshotCalls += 1;
       if (snapshotCalls === 1)
         return {
@@ -396,12 +410,16 @@ itWithCaptureCapability(
     expect(result.error.executionFailure).toBe(
       "fixture final snapshot failure",
     );
+    const temporaryRoot = snapshotObserverPaths[0]?.[0];
+    if (temporaryRoot === undefined)
+      throw new Error("expected the owned temporary root in snapshot inputs");
+    expect(snapshotObserverPaths).toEqual([[temporaryRoot], [temporaryRoot]]);
     const projected = projectAnalysisError(result.error);
     expect(projected).toMatchObject({
       code: "cleanup_incomplete",
       details: {
         cleanup: "incomplete",
-        resources: ["owned_process_group", "temporary_root"],
+        resources: ["owned_process_group", temporaryRoot],
       },
     });
     expect(projected).not.toHaveProperty("stack");
@@ -440,8 +458,9 @@ itWithCaptureCapability(
     );
     expect(observations.filesystem_snapshots.after).toEqual({
       state: "unavailable",
-      reason:
-        "Final filesystem snapshot failed: fixture final snapshot failure",
+      reason: expect.stringMatching(
+        /final.*snapshot.*fixture final snapshot failure/i,
+      ),
     });
     expect(observations.event_journal.state).toBe("available");
     if (observations.event_journal.state !== "available")
@@ -524,8 +543,10 @@ itWithCaptureCapability(
         },
       });
       expect(capture.exit.reason).toBe("timeout");
-      expect(capture.limitations).toContain(
-        "The executable digest is a prelaunch file sample; matching path metadata immediately after spawn does not prove an atomic operating-system image binding.",
+      expect(capture.limitations).toContainEqual(
+        expect.stringMatching(
+          /digest.*prelaunch.*path metadata.*does not prove.*atomic.*image binding/iu,
+        ),
       );
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -1023,13 +1044,10 @@ itWithCaptureCapability(
     await writeFile(path, "observed\n");
     const controller = new AbortController();
     const { signal } = controller;
-    const throwIfAborted = signal.throwIfAborted.bind(signal);
-    Object.defineProperty(signal, "throwIfAborted", {
-      value: () => {
-        controller.abort();
-        throwIfAborted();
-      },
-    });
+    const captureSnapshot: typeof snapshotRoots = async (...args) => {
+      controller.abort();
+      return snapshotRoots(...args);
+    };
 
     const result = await captureProcessScenario(
       processScenarioSchema.parse({
@@ -1038,6 +1056,9 @@ itWithCaptureCapability(
         filesystem_observation_paths: [path],
       }),
       signal,
+      process.platform,
+      process.env,
+      captureSnapshot,
     );
 
     if (result.ok) throw new Error("expected initial snapshot cancellation");

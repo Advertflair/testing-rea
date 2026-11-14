@@ -14,28 +14,43 @@ export interface RecordedResponseBody {
 const responseDeclarationSchema = z.object({
   response: z.object({
     status: z.unknown().optional(),
-    content: z
-      .object({
-        text: z.unknown().optional(),
-        encoding: z.unknown().optional(),
-        size: z.unknown().optional(),
-      })
-      .nullable()
-      .optional(),
+    content: z.unknown().optional(),
   }),
 });
+const responseContentDeclarationSchema = z.object({
+  text: z.unknown().optional(),
+  encoding: z.unknown().optional(),
+  size: z.unknown().optional(),
+  mimeType: z.unknown().optional(),
+});
 
-/** Retained response declarations shared by decoding and consumer-specific empty-body policies. */
-export const readRecordedResponseDeclaration = (
-  record: WebNetworkCaptureRecord,
-) => {
-  const parsed = responseDeclarationSchema.safeParse(record.reported);
-  return parsed.success ? parsed.data.response : undefined;
+/** Retain response facts independently: malformed content does not erase a reported status. */
+export const readRecordedResponseDeclaration = (reported: unknown) => {
+  const parsed = responseDeclarationSchema.safeParse(reported);
+  if (!parsed.success) return undefined;
+  const { status, content } = parsed.data.response;
+  const parsedContent = responseContentDeclarationSchema.safeParse(content);
+  return {
+    status,
+    content: parsedContent.success
+      ? parsedContent.data
+      : content === null
+        ? null
+        : undefined,
+  };
 };
 
 export type RecordedResponseDeclaration = ReturnType<
   typeof readRecordedResponseDeclaration
 >;
+
+/** HAR's zero status sentinel and nonnumeric declarations do not prove a response status. */
+export const recordedResponseStatus = (
+  declaration: RecordedResponseDeclaration,
+): number | null => {
+  const status = declaration?.status;
+  return typeof status === "number" && status !== 0 ? status : null;
+};
 
 /** Strict, and keeping a leading byte-order mark, so callers see the recorded text unchanged. */
 const strictUtf8 = (): TextDecoder =>
@@ -71,11 +86,33 @@ export const readRecordedResponseBody = (
   record: WebNetworkCaptureRecord,
   limitBytes: number,
   declaration: RecordedResponseDeclaration = readRecordedResponseDeclaration(
-    record,
+    record.reported,
   ),
 ): RecordedResponseBody => {
   const content = declaration?.content;
   if (content == null) return { bodyText: null };
+  const bodyCoordinates = [
+    "/response/content/text",
+    "/response/content/encoding",
+  ];
+  const within = (pointer: string, ancestor: string): boolean =>
+    pointer.startsWith(ancestor) &&
+    (pointer.length === ancestor.length || pointer[ancestor.length] === "/");
+  // Explicit value exclusions also govern imported retained facts. Keep their
+  // source text in complete Evidence, but never promote it into replay/state.
+  if (
+    record.redactions.some(
+      (redaction) =>
+        !("scope" in redaction) &&
+        bodyCoordinates.some((pointer) => within(pointer, redaction.pointer)),
+    ) ||
+    record.binary_fields.some(
+      (field) =>
+        field.state === "redacted" &&
+        bodyCoordinates.some((pointer) => within(pointer, field.pointer)),
+    )
+  )
+    return { bodyText: null };
   const { text, encoding } = content;
   if (typeof text !== "string") return { bodyText: null };
   if (encoding === undefined) {
@@ -101,7 +138,7 @@ export const readRecordedResponseBody = (
 export const recordedResponseBodyIsEmpty = (
   record: WebNetworkCaptureRecord,
   declaration: RecordedResponseDeclaration = readRecordedResponseDeclaration(
-    record,
+    record.reported,
   ),
 ): boolean => {
   const body = readRecordedResponseBody(record, 0, declaration);

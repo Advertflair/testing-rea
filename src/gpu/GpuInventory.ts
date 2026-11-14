@@ -20,6 +20,7 @@ import type {
 import {
   BinaryFormatFailure,
   BinaryResourceFailure,
+  BinaryStringReadLimitFailure,
 } from "../native/metadata/BinaryContainer.js";
 import {
   readElfSectionDirectory,
@@ -193,10 +194,7 @@ export class GpuInventory {
             continue;
           }
           if (!isGpuSection(section.name)) continue;
-          if (
-            !section.file_backed ||
-            (directory.format === "elf" && (section.flags & 0x800n) !== 0n)
-          ) {
+          if (!section.file_backed || section.compressed) {
             this.discovery = "partial";
             const message = `GPU section ${section.index} has no supported uncompressed file range`;
             this.#retain(message);
@@ -291,11 +289,13 @@ export class GpuInventory {
     if (cause instanceof GpuReportCapacityFailure) throw cause;
     if (
       !(cause instanceof BinaryFormatFailure) &&
-      !(cause instanceof BinaryResourceFailure)
+      !(cause instanceof BinaryResourceFailure) &&
+      !(cause instanceof BinaryStringReadLimitFailure)
     )
       throw cause;
     row.inspection =
-      cause instanceof BinaryResourceFailure
+      cause instanceof BinaryResourceFailure ||
+      cause instanceof BinaryStringReadLimitFailure
         ? "capacity"
         : cause.kind === "unsupported"
           ? "unsupported"
@@ -455,11 +455,13 @@ export class GpuInventory {
     this.#retain({
       payload_target: payload.value,
       cuda_target_header: payload.cudaHeader ?? null,
+      amd_target_metadata: payload.amdMetadata ?? null,
       target_consistency: state,
       target: selectedTarget ?? payload.value,
     });
     row.payload_target = payload.value;
     row.cuda_target_header = payload.cudaHeader ?? null;
+    row.amd_target_metadata = payload.amdMetadata ?? null;
     row.target_consistency = state;
     if (selectedTarget === null) row.target = payload.value;
     if (row.target === null) this.discovery = "partial";
@@ -513,6 +515,7 @@ export class GpuInventory {
       this.#target(row, {
         value: prepared.target,
         identity: prepared.targetIdentity,
+        amdMetadata: prepared.targetMetadata,
         scope: "amdgpu",
       });
       if (!inspected.ok) {

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { cdpResourceColumnSchema } from "../../domain/cdpObservationSchemas.js";
 
 const integer = z.int().min(0);
 const range = z.object({
@@ -30,7 +31,7 @@ export const runtimeStackSchema = z.object({
       scriptId: z.string(),
       url: z.string(),
       lineNumber: integer,
-      columnNumber: integer,
+      columnNumber: cdpResourceColumnSchema,
       functionName: z.string(),
     }),
   ),
@@ -38,22 +39,6 @@ export const runtimeStackSchema = z.object({
   parentId: z
     .object({ id: z.string(), debuggerId: z.string().optional() })
     .optional(),
-});
-/** Request evidence contains metadata and producer initiators; bodies and headers are outside this tool. */
-export const runtimeRequestSchema = z.object({
-  requestId: z.string().min(1),
-  frameId: z.string().optional(),
-  timestamp: z.number().min(0),
-  request: z.object({ url: z.string(), method: z.string() }),
-  initiator: z
-    .object({
-      type: z.string(),
-      stack: z.unknown().optional(),
-      url: z.string().optional(),
-      lineNumber: integer.optional(),
-      columnNumber: integer.optional(),
-    })
-    .passthrough(),
 });
 /** Native listener descriptors omit live remote handles from portable evidence. */
 export const runtimeListenersSchema = z.object({
@@ -65,7 +50,7 @@ export const runtimeListenersSchema = z.object({
       once: z.boolean(),
       scriptId: z.string(),
       lineNumber: integer,
-      columnNumber: integer,
+      columnNumber: cdpResourceColumnSchema,
     }),
   ),
 });

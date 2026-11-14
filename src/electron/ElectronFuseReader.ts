@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { lstat, type FileHandle } from "node:fs/promises";
 
 import { readMachoImage } from "../artifacts/apple/MachoLoadCommandReader.js";
+import { readFileHandleRange } from "../filesystem/readFileHandleRange.js";
 import {
   hasMachoMagic,
   readFatHeaderPrefix,
@@ -88,7 +89,6 @@ export const readElectronFuseImage = async (
   path: string,
   options?: {
     readonly signal?: AbortSignal;
-    readonly chunkBytes?: number;
     readonly selection?: ResolvedElectronFuseFile;
     readonly resources?: ArtifactResourceScope;
   },
@@ -140,15 +140,6 @@ export const readElectronFuseImage = async (
       `Selected artifact exceeds ${ELECTRON_FUSE_LIMITS.maximumFileBytes} bytes: ${path}`,
     );
   const size = Number(before.size);
-  const chunkBytes = options?.chunkBytes ?? ELECTRON_FUSE_LIMITS.chunkBytes;
-  if (
-    !Number.isSafeInteger(chunkBytes) ||
-    chunkBytes < 1 ||
-    chunkBytes > ELECTRON_FUSE_LIMITS.chunkBytes
-  )
-    throw new TypeError(
-      `chunkBytes must be an integer between 1 and ${ELECTRON_FUSE_LIMITS.chunkBytes}.`,
-    );
   return withArtifactRegularFile(
     path,
     options?.resources ?? new ArtifactResourceScope(),
@@ -165,7 +156,6 @@ export const readElectronFuseImage = async (
         path,
         size,
         container.slices,
-        chunkBytes,
         signal,
       );
       const current = await recheckPath(path);
@@ -197,10 +187,11 @@ const readerFor =
     assertArtifactReadActive(signal);
     if (length <= 0 || offset < 0 || offset >= size) return new Uint8Array();
     const bounded = Math.min(length, size - offset);
-    const buffer = Buffer.alloc(bounded);
-    const read = await handle.read(buffer, 0, bounded, offset);
-    if (read.bytesRead !== bounded) throw new RegularFileChangedError(path);
-    return buffer.subarray(0, read.bytesRead);
+    const buffer = await readFileHandleRange(handle, offset, bounded, () =>
+      assertArtifactReadActive(signal),
+    );
+    if (buffer.length !== bounded) throw new RegularFileChangedError(path);
+    return buffer;
   };
 
 const identifyContainer = async (
@@ -274,31 +265,10 @@ const identifyMacho = async (
     architecture: slice.architecture,
     ...(slice.hidden === undefined ? {} : { hidden: slice.hidden }),
   }));
-  assertNonOverlappingSlices(slices);
   return {
     format,
     slices,
   };
-};
-
-/** A FAT architecture owns a distinct byte range; overlap is malformed. */
-const assertNonOverlappingSlices = (ranges: readonly SliceRange[]): void => {
-  const ordered = [...ranges].sort(
-    (left, right) => left.fileOffset - right.fileOffset,
-  );
-  for (let index = 1; index < ordered.length; index += 1) {
-    const previous = ordered[index - 1];
-    const current = ordered[index];
-    if (
-      previous !== undefined &&
-      current !== undefined &&
-      current.fileOffset < previous.fileOffset + previous.size
-    )
-      throw new ElectronFuseFormatFailure(
-        "malformed",
-        `Mach-O slices ${previous.index} and ${current.index} overlap.`,
-      );
-  }
 };
 
 const scanSlices = async (
@@ -306,7 +276,6 @@ const scanSlices = async (
   path: string,
   size: number,
   ranges: readonly SliceRange[],
-  chunkBytes: number,
   signal: AbortSignal | undefined,
 ): Promise<{
   readonly sha256: string;
@@ -318,17 +287,18 @@ const scanSlices = async (
     hits: [] as number[],
   }));
   const hash = createHash("sha256");
-  const chunk = Buffer.allocUnsafe(chunkBytes);
+  const chunk = Buffer.allocUnsafe(ELECTRON_FUSE_LIMITS.chunkBytes);
   let position = 0;
   while (position < size) {
     assertArtifactReadActive(signal);
-    const length = Math.min(chunkBytes, size - position);
+    const length = Math.min(chunk.length, size - position);
     const read = await handle.read(chunk, 0, length, position);
-    if (read.bytesRead !== length) throw new RegularFileChangedError(path);
-    const piece = chunk.subarray(0, length);
+    if (read.bytesRead === 0) throw new RegularFileChangedError(path);
+    assertArtifactReadActive(signal);
+    const piece = chunk.subarray(0, read.bytesRead);
     hash.update(piece);
     absorbChunk(states, piece, position);
-    position += length;
+    position += read.bytesRead;
   }
   if (position !== size) throw new RegularFileChangedError(path);
   const slices: ElectronFuseSlice[] = [];
@@ -462,9 +432,10 @@ const readExact = async (
   signal: AbortSignal | undefined,
 ): Promise<Buffer> => {
   assertArtifactReadActive(signal);
-  const buffer = Buffer.alloc(length);
-  const read = await handle.read(buffer, 0, length, offset);
-  if (read.bytesRead !== length) throw new RegularFileChangedError(path);
+  const buffer = await readFileHandleRange(handle, offset, length, () =>
+    assertArtifactReadActive(signal),
+  );
+  if (buffer.length !== length) throw new RegularFileChangedError(path);
   return buffer;
 };
 

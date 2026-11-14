@@ -1,17 +1,24 @@
+import type {
+  FileMapping,
+  ZeroFillMapping,
+} from "../../domain/virtualFileMapping.js";
+import { decodeMachoFixedName } from "../AppleMachoNames.js";
 import {
+  isMachoZeroFillSection,
   readMachoSectionHeader,
   type MachoSectionHeader,
 } from "../../domain/apple/machoSectionHeader.js";
-import { readMachoSegmentHeader } from "../../domain/apple/machoSegmentHeader.js";
+import {
+  admitMachoSegmentCommand,
+  readMachoSegmentHeader,
+} from "../../domain/apple/machoSegmentHeader.js";
 import {
   declaredFileRange,
   BinaryFormatFailure,
   BinaryReader,
   type BinaryContainer,
-  type FileMapping,
   type ImageSection,
   type LoadRegion,
-  type ZeroFillMapping,
 } from "./BinaryContainer.js";
 import {
   MachoLoadCommandCursor,
@@ -76,20 +83,18 @@ export const readMachoImage = (bytes: Buffer): BinaryContainer => {
         sectionCount,
         nameBytes,
       } = parsedSegment.value;
-      const unmapped = memorySize === 0n && protection === 0;
-      if (
-        (!unmapped && fileSize > memorySize) ||
-        address + memorySize > 1n << BigInt(bits)
-      )
+      const admitted = admitMachoSegmentCommand(
+        parsedSegment.value,
+        size,
+        bits,
+        bytes.length,
+      );
+      if (!admitted.ok)
         throw new BinaryFormatFailure(
-          "malformed",
-          "Mach-O segment addresses or sizes are invalid",
+          admitted.error.kind,
+          admitted.error.message,
         );
-      if (sectionCount > Math.floor((size - segmentHeader) / sectionWidth))
-        throw new BinaryFormatFailure(
-          "malformed",
-          "Mach-O section table exceeds its segment command",
-        );
+      const { unmapped } = admitted.value;
       const fileRange =
         fileSize === 0n
           ? undefined
@@ -98,7 +103,7 @@ export const readMachoImage = (bytes: Buffer): BinaryContainer => {
         unmapped || fileRange === undefined
           ? undefined
           : { ...fileRange, address };
-      const name = fixedName(nameBytes);
+      const name = decodeMachoFixedName(nameBytes);
       if (mapping !== undefined && name !== "__PAGEZERO") {
         mappings.push(mapping);
         loadRegions.push({
@@ -199,9 +204,9 @@ const machoImageSection = ({
 }): ImageSection => {
   const { flags, address: sectionAddress, size: sectionSize } = section;
   const sectionOffset = BigInt(section.offset);
-  const sectionName = fixedName(section.nameBytes);
-  const name = `${fixedName(section.segmentNameBytes)},${sectionName}`;
-  const zeroFill = [1, 0xc, 0x12].includes(flags & 0xff);
+  const sectionName = decodeMachoFixedName(section.nameBytes);
+  const name = `${decodeMachoFixedName(section.segmentNameBytes)},${sectionName}`;
+  const zeroFill = isMachoZeroFillSection(flags);
   const addressDelta = sectionAddress - segmentAddress;
   const fileDelta = sectionOffset - segmentFileOffset;
   const inSegmentMemory =
@@ -227,18 +232,18 @@ const machoImageSection = ({
     name,
     section_name: sectionName,
     type: flags & 0xff,
+    flags,
     address: sectionAddress,
     declared_range: { offset: sectionOffset, size: sectionSize },
     segment_mapping: segmentMapping,
     segment_unmapped: segmentUnmapped,
+    relocations: {
+      offset: section.relocationOffset,
+      count: section.relocationCount,
+    },
     ...range,
     file_backed: fileBacked,
     read_only: readOnly,
     compressed: false,
   };
-};
-
-const fixedName = (bytes: Buffer): string => {
-  const nul = bytes.indexOf(0);
-  return bytes.subarray(0, nul < 0 ? bytes.length : nul).toString("latin1");
 };

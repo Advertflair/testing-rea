@@ -1,3 +1,4 @@
+import { evidenceBundleSchema } from "../../../src/domain/evidenceBundle.js";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { readFile, writeFile } from "node:fs/promises";
@@ -117,9 +118,11 @@ it("preserves file URL scheme spelling and script identity after real Inspector 
 
   const retained = await call("get_evidence_bundle", {});
   expect(retained.isError, JSON.stringify(retained.content)).not.toBe(true);
-  const records = toolContract("get_evidence_bundle").outputSchema.parse(
-    retained.structuredContent,
-  ).result.records;
+  const { records } = evidenceBundleSchema.parse(
+    toolContract("get_evidence_bundle").outputSchema.parse(
+      retained.structuredContent,
+    ).result,
+  );
   const original = records.find(
     (record) => record.evidence_id === first.evidence_id,
   );
@@ -128,4 +131,4 @@ it("preserves file URL scheme spelling and script identity after real Inspector 
   expect(original.predicate_type).toBe(first.predicate_type);
   expect(original.normalized_result).toEqual(first.normalized_result);
   expect(await readFile(source, "utf8")).toBe(sourceText);
-}, 30_000);
+});

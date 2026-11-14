@@ -220,9 +220,13 @@ cliTest.skipIf(process.platform === "win32")(
     for (const scenario of displayScenarios) {
       await writeFile(fixture.size, scenario.size);
       await writeFile(fixture.density, scenario.density);
-      const output = await cli.run({
+      const invocation = {
         arguments: ["inspect-adb-display", SERIAL, "--json"],
         environment: fixture.environment,
+      };
+      const output = await cli.run({
+        ...invocation,
+        freshProcess: scenario === displayScenarios[0],
       });
       expect(output.exitCode, `${scenario.name}: ${output.stderr}`).toBe(0);
       const evidence = contract.outputSchema.parse(output.json);
@@ -274,9 +278,13 @@ cliTest.skipIf(process.platform === "win32")(
           "",
         ].join("\n"),
       );
-      const output = await cli.run({
+      const invocation = {
         arguments: ["inspect-adb-display", SERIAL, "--json"],
         environment: fixture.environment,
+      };
+      const output = await cli.run({
+        ...invocation,
+        freshProcess: value === null,
       });
       expect(output.exitCode, output.stderr).toBe(1);
       const projected = analysisErrorProjectionSchema.parse(output.json);
@@ -444,9 +452,13 @@ cliTest.skipIf(process.platform === "win32")(
           "",
         ].join("\n"),
       );
-      const output = await cli.run({
+      const invocation = {
         arguments: ["inspect-adb-package", SERIAL, PACKAGE, "--json"],
         environment: fixture.environment,
+      };
+      const output = await cli.run({
+        ...invocation,
+        freshProcess: scenario === packageScenarios[0],
       });
       expect(output.exitCode, `${scenario.name}: ${output.stderr}`).toBe(0);
       const evidence = contract.outputSchema.parse(output.json);
